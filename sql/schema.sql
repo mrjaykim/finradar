@@ -78,12 +78,13 @@ CREATE TABLE mart.financial_statement (
     sj_div          text NOT NULL CHECK (sj_div IN ('BS', 'IS', 'CIS', 'CF', 'SCE')),
     account_id      text NOT NULL,
     account_nm      text NOT NULL,
+    account_detail  text,  -- SCE(자본변동표)에서 account_id+ord가 같아도 자본 구성요소별로 값이 달라 유일성 판별에 필요
     metric_amount   bigint,
     currency        text,
     ord             smallint,
     rcept_no        text NOT NULL REFERENCES mart.filing (rcept_no),
     created_at      timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (corp_code, bsns_year, reprt_code, fs_div, sj_div, account_id, ord)
+    UNIQUE (corp_code, bsns_year, reprt_code, fs_div, sj_div, account_id, account_detail, ord)
 );
 
 CREATE INDEX idx_financial_statement_rcept_no ON mart.financial_statement (rcept_no);
