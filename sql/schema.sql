@@ -135,3 +135,21 @@ CREATE TABLE mart.delisted_company (
 );
 
 CREATE INDEX idx_delisted_company_delisted_on ON mart.delisted_company (delisted_on);
+
+-- ============================================================
+-- raw.krx_company_summary
+-- KIND 기업개황 팝업(companysummary.do?method=searchCompanySummaryOvrvwDetail) 응답을
+-- 가공/제약 없이 그대로 적재. krx_isu_cd -> 6자리 종목코드 매핑 확보 목적 (ADR-006 후속)
+-- ============================================================
+CREATE TABLE raw.krx_company_summary (
+    id               bigserial PRIMARY KEY,
+    krx_isu_cd       text NOT NULL,
+    stock_code_raw   text,
+    corp_name_raw    text,  -- comAbbrv hidden input 값 (예: '(주)아크솔루션스')
+    row_html         text,  -- 파싱 전 원본 응답 HTML (재파싱/재현용)
+    ingested_at      timestamptz NOT NULL DEFAULT now()
+);
+
+-- mart.company(stock_code)와 정확 키 조인을 위한 컬럼. companysummary.do 크롤링으로 백필되며
+-- 상장폐지 회사는 mart.company(활성 상장사 마스터)에 없는 경우가 많아 FK는 걸지 않는다.
+ALTER TABLE mart.delisted_company ADD COLUMN stock_code text;
