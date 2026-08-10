@@ -1,0 +1,13 @@
+{
+  "total_entities": 1751,
+  "pattern_a_no_corp_code": 402,
+  "pattern_b_name_mismatch": 547,
+  "pattern_c_matched": 802,
+  "pattern_b_non_distress": 138,
+  "pattern_b_distress": 409,
+  "category_1_notation_diff_rescued": 272,
+  "category_3_merger_split_heuristic": 1,
+  "category_4_stock_code_reuse": 0,
+  "category_5_unresolved_incl_rename": 136,
+  "note": "카테고리 2(상호변경)는 KIND 공식 상호변경 이력 데이터가 없어 별도 분리하지 못했고 category_5_unresolved_incl_rename에 합산됨. 카테고리 4는 KRX가 폐지 종목코드를 재사용하지 않는다는 정책 사실(ADR-008)에 근거해 0으로 고정."
+}
