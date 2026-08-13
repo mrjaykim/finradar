@@ -64,3 +64,24 @@ DART OpenAPI 재무제표 API(`fnlttSinglAcntAll`/`fnlttSinglAcnt`)는 공식 �
    12분기. 단순히 "최근 분기"로 고정하지 않고, Positive 사건의 연도별 분포에 맞춰
    시점을 층화 샘플링한다 - 그렇지 않으면 모델이 진짜 리스크 신호 대신 "오래된
    스냅샷=위험, 최근=안전" 같은 시간 아티팩트를 학습할 위험이 있다.
+
+## 추가 결정 (2026-08-13): industry_code 원시값 확보
+
+### 전제 정정
+트레이드오프 항목의 "industry_code가 없어 업종 층화는 불가능하다"는 표현은 부정확했다.
+실제로는 corpCode.xml 벌크 적재 파이프라인(`load_mart_company.py`)에 업종 필드가 없었을
+뿐이고, DART OpenAPI의 기업개황(`company.json`) 엔드포인트는 `induty_code`(업종코드)를
+제공한다(`crtfc_key`+`corp_code` 단건 조회, 배치 불가). 일일 호출 한도(10,000회) 대비
+회사 1개당 1콜의 비용은 크지 않다(대상 3,660건 기준 약 37%).
+
+### 결정
+1. `mart.company.industry_code`에 `company.json`의 `induty_code` 원시값을 그대로 채운다
+   (`scripts/backfill_company_industry_code.py`). 대상은 is_active=true 전체 상장사
+   (2,904건) + 2010년 이후 실질부실 상장폐지 기업(756건 후보군) = 3,660건이며,
+   `raw.dart_company_overview`에 원본 응답을 적재한 뒤 mart를 갱신한다.
+2. "정상기업 후보"를 ADR-010 항목 5의 1:3 목표치(756×3=2,268)가 아니라 is_active=true
+   전체(2,904건)로 잡았다 - 층화 샘플링 로직 자체가 아직 4주차 미구현 작업이라, 지금
+   목록을 확정하는 대신 전체를 미리 확보해 4주차에 어떤 샘플링 방식을 쓰든 추가 API
+   호출 없이 진행할 수 있게 하기 위함이다.
+3. `induty_code`는 KSIC 세분류 수준 원시코드라 그 자체로는 층화 그룹으로 쓰기 어렵다.
+   대분류/중분류 매핑과 실제 층화 샘플링 설계는 계속 4주차 모델링 단계로 보류한다.

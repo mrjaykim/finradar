@@ -153,3 +153,19 @@ CREATE TABLE raw.krx_company_summary (
 -- mart.company(stock_code)와 정확 키 조인을 위한 컬럼. companysummary.do 크롤링으로 백필되며
 -- 상장폐지 회사는 mart.company(활성 상장사 마스터)에 없는 경우가 많아 FK는 걸지 않는다.
 ALTER TABLE mart.delisted_company ADD COLUMN stock_code text;
+
+-- ============================================================
+-- raw.dart_company_overview
+-- DART 기업개황(company.json) 응답을 가공/제약 없이 그대로 적재. induty_code(업종코드)
+-- 원시값 백필 목적 (ADR-010 참고, 2026-08-13 추가 결정)
+-- ============================================================
+CREATE TABLE raw.dart_company_overview (
+    id               bigserial PRIMARY KEY,
+    corp_code        text NOT NULL,
+    status           text,
+    message          text,
+    induty_code_raw  text,
+    corp_name_raw    text,
+    response_json    jsonb,
+    ingested_at      timestamptz NOT NULL DEFAULT now()
+);
