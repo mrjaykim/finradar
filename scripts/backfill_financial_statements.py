@@ -39,6 +39,13 @@ DAILY_CALL_TARGET = 30000
 BATCH_COMMIT_SIZE = 50
 PROGRESS_EVERY = 200
 BLOCK_STATUS_CODES = {"020", "012", "010", "011"}
+RETRYABLE_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,  # requests.exceptions.SSLError를 포함(ConnectionError의 서브클래스)
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+MAX_FETCH_RETRIES = 3
+RETRY_BACKOFF_BASE = 1.0  # 1s, 2s, 4s
 
 REPRT_CODE_BY_Q = {1: "11013", 2: "11012", 3: "11014", 4: "11011"}  # 1분기/반기/3분기/사업보고서
 QUARTER_BY_REPRT_CODE = {v: k for k, v in REPRT_CODE_BY_Q.items()}
@@ -122,19 +129,33 @@ def filter_pending(conn, worklist: list[tuple[str, int, str]]) -> list[tuple[str
 
 
 def fetch_financial_statement(corp_code: str, bsns_year: int, reprt_code: str, api_key: str) -> dict:
-    resp = requests.get(
-        FS_URL,
-        params={
-            "crtfc_key": api_key,
-            "corp_code": corp_code,
-            "bsns_year": bsns_year,
-            "reprt_code": reprt_code,
-            "fs_div": FS_DIV,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    """네트워크성 예외(SSLError/ConnectionError/Timeout 등)는 지수 백오프로 최대
+    MAX_FETCH_RETRIES회 재시도한다. 재시도를 다 써도 실패하면 마지막 예외를 그대로 올려
+    호출부(main)가 해당 항목만 실패 처리하고 배치 나머지는 계속 진행하게 한다."""
+    for attempt in range(MAX_FETCH_RETRIES + 1):
+        try:
+            resp = requests.get(
+                FS_URL,
+                params={
+                    "crtfc_key": api_key,
+                    "corp_code": corp_code,
+                    "bsns_year": bsns_year,
+                    "reprt_code": reprt_code,
+                    "fs_div": FS_DIV,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except RETRYABLE_EXCEPTIONS as e:
+            if attempt == MAX_FETCH_RETRIES:
+                raise
+            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+            print(
+                f"경고: {corp_code} {bsns_year} {reprt_code} 네트워크 오류(재시도 {attempt + 1}/{MAX_FETCH_RETRIES}, {wait:.0f}초 대기): {e}",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
 
 
 def clean_account_id(account_id) -> str:
@@ -266,6 +287,7 @@ def main(daily_target: int = DAILY_CALL_TARGET):
         completed = 0
         ok = 0
         no_data = 0
+        failed = 0
         blocked = False
         block_detail = None
         start = time.monotonic()
@@ -284,7 +306,9 @@ def main(daily_target: int = DAILY_CALL_TARGET):
                 try:
                     data = future.result()
                 except Exception as e:
-                    print(f"경고: {corp_code} {bsns_year} {reprt_code} 처리 중 오류: {e}", file=sys.stderr)
+                    print(f"경고: {corp_code} {bsns_year} {reprt_code} 처리 중 오류(재시도 소진): {e}", file=sys.stderr)
+                    with lock:
+                        failed += 1
                     if "429" in str(e):
                         blocked = True
                         block_detail = f"HTTP 429 (corp_code={corp_code})"
@@ -318,7 +342,7 @@ def main(daily_target: int = DAILY_CALL_TARGET):
 
                 if n % PROGRESS_EVERY == 0 or n == len(todo):
                     elapsed = time.monotonic() - start
-                    print(f"진행 {n}/{len(todo)} | 성공 {ok} | 데이터없음 {no_data} | {elapsed:.0f}초 경과")
+                    print(f"진행 {n}/{len(todo)} | 성공 {ok} | 데이터없음 {no_data} | 실패 {failed} | {elapsed:.0f}초 경과")
 
                 if blocked:
                     print(
@@ -333,7 +357,7 @@ def main(daily_target: int = DAILY_CALL_TARGET):
         elapsed = time.monotonic() - start
         remaining_after = len(pending) - completed
         print("\n=== 완료 ===")
-        print(f"이번 실행 처리: {completed}건 (성공 {ok}, 데이터없음 {no_data}), 소요 {elapsed:.1f}초")
+        print(f"이번 실행 처리: {completed}건 (성공 {ok}, 데이터없음 {no_data}, 실패 {failed}), 소요 {elapsed:.1f}초")
         print(f"남은 미처리: {remaining_after}건 (내일 재실행하면 자동으로 이어짐)")
         print(f"차단 감지: {blocked}" + (f" ({block_detail})" if blocked else ""))
     finally:
