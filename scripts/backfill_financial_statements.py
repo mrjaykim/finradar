@@ -5,18 +5,20 @@ DART fnlttSinglAcntAll.json에서 수집해 raw.dart_financial_statement / mart.
 분기 산정 규칙(2026-08-19 세션 합의, ADR-010 후속):
   - 부실기업: delisted_on 기준 과거 최대 12분기, 2015-01-01 하한
   - 정상기업: 오늘 기준 과거 최대 12분기, 2015-01-01 하한
-  - fs_div=CFS(연결재무제표)만 사용한다. OFS 폴백은 넣지 않았다 - 사전에 합의한 호출 수
-    추정("분기 1개 = 호출 1건")과 어긋나지 않게 하기 위한 단순화이며, 연결재무제표가 없는
-    기업은 해당 분기가 "데이터 없음"으로 남는 알려진 한계다.
+  - 기본은 fs_div=CFS(연결재무제표). 2026-10-10 세션에서 OFS 폴백 모드(--ofs-fallback)를
+    추가했다: CFS를 전부(해당 기업의 모든 시도) 013(데이터없음)으로 끝낸 "0분기 기업"
+    924개(부실 250 + 정상 674)만 대상으로 fs_div=OFS로 재조회한다. CFS 중 일부 연도만
+    013인 "부분 결측" 기업(540개)은 이미 데이터가 일부 확보돼 있어 이번 폴백 범위 밖이다.
 
 하루 호출량은 DAILY_CALL_TARGET(기본 30,000, 실제 여유 한도보다 넉넉히 낮게 잡은 값)으로
 캡을 걸어 미처리 목록의 앞부분만 잘라서 처리한다. 이미 raw.dart_financial_statement에 기록된
-(corp_code, bsns_year, reprt_code) 조합은 건너뛰므로, 다음날 그냥 재실행하면 남은 부분부터
-자동으로 이어진다 - 별도 상태 파일이 필요 없다.
+(corp_code, bsns_year, reprt_code, fs_div) 조합은 건너뛰므로, 다음날 그냥 재실행하면 남은
+부분부터 자동으로 이어진다 - 별도 상태 파일이 필요 없다.
 
 020(요청 제한)/429 등 차단 신호가 관측되면 목표치 도달 여부와 무관하게 즉시 중단한다
 (하루 목표 캡과는 별개의 이중 안전장치).
 """
+import argparse
 import sys
 import threading
 import time
@@ -113,22 +115,76 @@ def build_worklist(conn) -> list[tuple[str, int, str]]:
     return worklist
 
 
-def filter_pending(conn, worklist: list[tuple[str, int, str]]) -> list[tuple[str, int, str]]:
+def build_ofs_fallback_worklist(conn) -> list[tuple[str, int, str]]:
+    """CFS를 분기 전부(해당 기업의 모든 CFS 시도) 013(데이터없음)으로 끝낸 "0분기 기업"의
+    (corp_code, bsns_year, reprt_code) 조합만 모은다.
+
+    CFS 일부 연도만 013인 "부분 결측" 기업은 제외한다 - 이미 일부 분기는 CFS로 확보돼
+    있어 이번 폴백(2026-10-10 세션에서 합의한 924개 "0분기 기업" 복구)의 범위 밖이다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH cfs_attempts AS (
+                SELECT corp_code, bsns_year, reprt_code,
+                       (source_payload->>'status' = '013') AS is_013
+                FROM raw.dart_financial_statement WHERE fs_div = 'CFS'
+            ),
+            per_company AS (
+                SELECT corp_code, count(*) AS total_attempts, count(*) FILTER (WHERE is_013) AS n_013
+                FROM cfs_attempts GROUP BY corp_code
+            ),
+            fully_missing AS (
+                SELECT corp_code FROM per_company WHERE n_013 = total_attempts AND total_attempts > 0
+            )
+            SELECT DISTINCT r.corp_code, r.bsns_year, r.reprt_code
+            FROM raw.dart_financial_statement r
+            WHERE r.fs_div = 'CFS' AND r.source_payload->>'status' = '013'
+              AND r.corp_code IN (SELECT corp_code FROM fully_missing)
+            """
+        )
+        return [(row[0], int(row[1]), row[2]) for row in cur.fetchall()]
+
+
+def classify_breakdown(conn, corp_codes: list[str]) -> tuple[int, int]:
+    """corp_code 목록을 부실/정상 기업 수로 분류한다 (--dry-run 출력용)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                count(*) FILTER (WHERE d.corp_code IS NOT NULL) AS distress,
+                count(*) FILTER (WHERE d.corp_code IS NULL AND m.is_active) AS normal
+            FROM unnest(%s) AS cc(corp_code)
+            LEFT JOIN (
+                SELECT DISTINCT c.corp_code
+                FROM mart.delisted_company d
+                JOIN mart.company c ON d.stock_code = c.stock_code
+                WHERE d.is_financial_distress = true AND d.delisted_on >= '2010-01-01'
+            ) d ON d.corp_code = cc.corp_code
+            LEFT JOIN mart.company m ON m.corp_code = cc.corp_code
+            """,
+            (corp_codes,),
+        )
+        return cur.fetchone()
+
+
+def filter_pending(conn, worklist: list[tuple[str, int, str]], fs_div: str = FS_DIV) -> list[tuple[str, int, str]]:
     """이미 raw.dart_financial_statement에 기록된(=이미 시도한) 조합을 제외한다.
 
     데이터가 없던 호출(013 등)도 플레이스홀더 1행으로 기록되므로, 성공/실패 여부와 무관하게
-    "이미 호출을 시도했는가"만으로 재시도 여부를 가른다.
+    "이미 호출을 시도했는가"만으로 재시도 여부를 가른다. fs_div별로 독립적으로 추적한다
+    (CFS 013으로 끝난 조합도 OFS는 아직 안 시도한 것으로 취급).
     """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT DISTINCT corp_code, bsns_year, reprt_code FROM raw.dart_financial_statement WHERE fs_div = %s",
-            (FS_DIV,),
+            (fs_div,),
         )
         done = {(row[0], str(row[1]), row[2]) for row in cur.fetchall()}
     return [t for t in worklist if (t[0], str(t[1]), t[2]) not in done]
 
 
-def fetch_financial_statement(corp_code: str, bsns_year: int, reprt_code: str, api_key: str) -> dict:
+def fetch_financial_statement(corp_code: str, bsns_year: int, reprt_code: str, api_key: str, fs_div: str = FS_DIV) -> dict:
     """네트워크성 예외(SSLError/ConnectionError/Timeout 등)는 지수 백오프로 최대
     MAX_FETCH_RETRIES회 재시도한다. 재시도를 다 써도 실패하면 마지막 예외를 그대로 올려
     호출부(main)가 해당 항목만 실패 처리하고 배치 나머지는 계속 진행하게 한다."""
@@ -141,7 +197,7 @@ def fetch_financial_statement(corp_code: str, bsns_year: int, reprt_code: str, a
                     "corp_code": corp_code,
                     "bsns_year": bsns_year,
                     "reprt_code": reprt_code,
-                    "fs_div": FS_DIV,
+                    "fs_div": fs_div,
                 },
                 timeout=30,
             )
@@ -192,17 +248,17 @@ def parse_ord(value):
         return None
 
 
-def insert_raw(conn, corp_code: str, bsns_year: int, reprt_code: str, data: dict) -> list[dict]:
+def insert_raw(conn, corp_code: str, bsns_year: int, reprt_code: str, data: dict, fs_div: str = FS_DIV) -> list[dict]:
     """raw 레이어에 원본을 적재한다. 데이터가 없으면(013 등) 재조회 방지용 플레이스홀더 1행을 남긴다."""
     rows = data.get("list") or []
     if rows:
         values = [
-            tuple(FS_DIV if col == "fs_div" else row.get(col) for col in RAW_COLUMNS) + (Json(row),)
+            tuple(fs_div if col == "fs_div" else row.get(col) for col in RAW_COLUMNS) + (Json(row),)
             for row in rows
         ]
     else:
         placeholder = {col: None for col in RAW_COLUMNS}
-        placeholder.update(corp_code=corp_code, bsns_year=str(bsns_year), reprt_code=reprt_code, fs_div=FS_DIV)
+        placeholder.update(corp_code=corp_code, bsns_year=str(bsns_year), reprt_code=reprt_code, fs_div=fs_div)
         values = [tuple(placeholder[col] for col in RAW_COLUMNS) + (Json(data),)]
 
     with conn.cursor() as cur:
@@ -230,14 +286,14 @@ def upsert_filing(conn, rcept_no: str, corp_code: str, bsns_year: int, reprt_cod
         )
 
 
-def upsert_mart(conn, rows: list[dict], corp_code: str, bsns_year: int, reprt_code: str):
+def upsert_mart(conn, rows: list[dict], corp_code: str, bsns_year: int, reprt_code: str, fs_div: str = FS_DIV):
     if not rows:
         return
     upsert_filing(conn, rows[0]["rcept_no"], corp_code, bsns_year, reprt_code)
     quarter = QUARTER_BY_REPRT_CODE[reprt_code]
     values = [
         (
-            corp_code, bsns_year, reprt_code, quarter, FS_DIV,
+            corp_code, bsns_year, reprt_code, quarter, fs_div,
             row.get("sj_div"), clean_account_id(row.get("account_id")), row.get("account_nm"),
             row.get("account_detail"), parse_amount(row.get("thstrm_amount")), row.get("currency"),
             parse_ord(row.get("ord")), row.get("rcept_no"),
@@ -263,17 +319,17 @@ def upsert_mart(conn, rows: list[dict], corp_code: str, bsns_year: int, reprt_co
         )
 
 
-def main(daily_target: int = DAILY_CALL_TARGET):
+def main(daily_target: int = DAILY_CALL_TARGET, ofs_fallback: bool = False, dry_run: bool = False):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    api_key = get_dart_api_key()
+    fs_div = "OFS" if ofs_fallback else FS_DIV
     conn = psycopg2.connect(**get_db_config())
 
     try:
-        print("작업 목록 생성 중...")
-        full_worklist = build_worklist(conn)
-        pending = filter_pending(conn, full_worklist)
+        print(f"작업 목록 생성 중... (모드: {'OFS 폴백' if ofs_fallback else 'CFS'})")
+        full_worklist = build_ofs_fallback_worklist(conn) if ofs_fallback else build_worklist(conn)
+        pending = filter_pending(conn, full_worklist, fs_div=fs_div)
         print(f"전체 대상 {len(full_worklist)}건 중 미처리 {len(pending)}건")
 
         if not pending:
@@ -282,6 +338,15 @@ def main(daily_target: int = DAILY_CALL_TARGET):
 
         todo = pending[:daily_target]
         print(f"오늘 목표(최대 {daily_target}건) 내에서 {len(todo)}건 처리 시작\n")
+
+        if dry_run:
+            distress, normal = classify_breakdown(conn, list({t[0] for t in todo}))
+            print("*** --dry-run: API 호출 없이 작업목록만 확인 ***")
+            print(f"처리 대상 조합: {len(todo)}건")
+            print(f"기업 구성(조합 기준 corp_code 중복 포함 아님, distinct): 부실 {distress} / 정상 {normal}")
+            return
+
+        api_key = get_dart_api_key()
 
         lock = threading.Lock()
         completed = 0
@@ -294,7 +359,7 @@ def main(daily_target: int = DAILY_CALL_TARGET):
 
         with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
             future_to_task = {
-                pool.submit(fetch_financial_statement, corp_code, bsns_year, reprt_code, api_key): (corp_code, bsns_year, reprt_code)
+                pool.submit(fetch_financial_statement, corp_code, bsns_year, reprt_code, api_key, fs_div): (corp_code, bsns_year, reprt_code)
                 for corp_code, bsns_year, reprt_code in todo
             }
             for future in as_completed(future_to_task):
@@ -321,8 +386,8 @@ def main(daily_target: int = DAILY_CALL_TARGET):
                     try:
                         with conn.cursor() as cur:
                             cur.execute("SAVEPOINT item_sp")
-                        rows = insert_raw(conn, corp_code, bsns_year, reprt_code, data)
-                        upsert_mart(conn, rows, corp_code, bsns_year, reprt_code)
+                        rows = insert_raw(conn, corp_code, bsns_year, reprt_code, data, fs_div)
+                        upsert_mart(conn, rows, corp_code, bsns_year, reprt_code, fs_div)
                     except Exception as e:
                         # 이 항목만 되돌리고, 같은 트랜잭션의 이전 성공 건들은 그대로 유지한다
                         # (한 건의 FK/제약 위반이 커밋 전 배치 전체를 날리는 것을 방지)
@@ -365,5 +430,9 @@ def main(daily_target: int = DAILY_CALL_TARGET):
 
 
 if __name__ == "__main__":
-    target_arg = int(sys.argv[1]) if len(sys.argv) > 1 else DAILY_CALL_TARGET
-    main(daily_target=target_arg)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("daily_target", nargs="?", type=int, default=DAILY_CALL_TARGET)
+    parser.add_argument("--ofs-fallback", action="store_true", help="CFS 013(0분기 기업)만 OFS로 재조회")
+    parser.add_argument("--dry-run", action="store_true", help="API 호출 없이 작업목록 건수/구성만 출력")
+    args = parser.parse_args()
+    main(daily_target=args.daily_target, ofs_fallback=args.ofs_fallback, dry_run=args.dry_run)
